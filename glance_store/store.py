@@ -60,7 +60,7 @@ class Store(object):
 
     def __init__(self, conf=CONF):
         self._conf = conf
-        self.create_stores()
+        self._create_stores()
 
     def _list_opts():
         driver_opts = []
@@ -87,26 +87,26 @@ class Store(object):
         return ([(_STORE_CFG_GROUP, _STORE_OPTS)] +
                 [(_STORE_CFG_GROUP, driver_opts)])
 
-    def _register_opts(conf):
+    def _register_opts(self):
         opts = _list_opts()
         for group, opt_list in opts:
             LOG.debug("Registering options for group %s" % group)
             for opt in opt_list:
-                conf.register_opt(opt, group=group)
+                self._conf.register_opt(opt, group=group)
 
-    def _load_single_store(conf, store_entry, invoke_load=True):
+    def _load_single_store(self, store_entry, invoke_load=True):
         try:
             LOG.debug("Attempting to import store %s", store_entry)
             mgr = driver.DriverManager('glance_store.drivers',
                                        store_entry,
-                                       invoke_args=[conf],
+                                       invoke_args=[self._conf],
                                        invoke_on_load=invoke_load)
             return mgr.driver
         except RuntimeError:
             LOG.warn("Failed to load driver %(driver)s."
                      "The driver will be disabled" % dict(driver=driver))
 
-    def _load_stores():
+    def _load_stores(self):
         for store_entry in set(self._conf.glance_store.stores):
             store_instance = _load_single_store(self._conf, store_entry)
 
@@ -116,15 +116,15 @@ class Store(object):
             yield (store_entry, store_instance)
 
 
-    def create_stores(self):
-        """
+    def _create_stores(self):
+       """
         Registers all store modules and all schemes
         from the given config. Duplicates are not re-registered.
         """
         store_count = 0
 
         for (store_entry, store_instance) in _load_stores():
-            try:
+           try:
                 schemes = store_instance.get_schemes()
                 store_instance.configure()
             except NotImplementedError:
@@ -150,7 +150,7 @@ class Store(object):
         return store_count
 
     def verify_default_store(self):
-        scheme = CONF.glance_store.default_store
+       scheme = CONF.glance_store.default_store
         try:
             get_store_from_scheme(scheme)
         except exceptions.UnknownScheme:
