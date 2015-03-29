@@ -117,6 +117,20 @@ class Store(capabilities.StoreCapability):
         """
         raise NotImplementedError
 
+    @capabilities.check
+    def read(self, location):
+        """
+        Takes a `glance_store.location.Location` object that indicates
+        where to find the image file, and returns a tuple of generator
+        (for reading the image file) and image_size
+
+        :param location `glance_store.location.Location` object, supplied
+                        from glance_store.location.get_location_from_uri()
+        :raises `glance.exceptions.NotFound` if image does not exist
+        """
+        raise NotImplementedError
+
+
     def get_size(self, location, context=None):
         """
         Takes a `glance_store.location.Location` object that indicates
@@ -143,6 +157,23 @@ class Store(capabilities.StoreCapability):
                and a dictionary with storage system specific information
         :raises `glance_store.exceptions.Duplicate` if the image already
                 existed
+        """
+        raise NotImplementedError
+
+    @capabilities.check
+    def write(self, iid, image_data, size=0, permission=0):
+
+        """
+        Stores an image file to the determined directory with the iid
+        as the filename.
+
+        :param image_id: The opaque image identifier
+        :param image_data: The image data to write, as a file-like object
+        :param image_size: The size of the image data to write, in bytes
+
+        :param location `glance_store.location.Location` object, supplied
+                        from glance_store.location.get_location_from_uri()
+        :raises `glance.exceptions.NotFound` if image does not exist
         """
         raise NotImplementedError
 

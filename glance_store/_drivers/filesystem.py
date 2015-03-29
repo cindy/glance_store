@@ -626,3 +626,542 @@ class Store(glance_store.driver.Store):
             msg = _('Unable to remove partial image '
                     'data for image %(iid)s: %(e)s')
             LOG.error(msg % dict(iid=iid, e=utils.exception_to_str(e)))
+
+
+class FSBackendFile(object):
+
+    _CAPABILITIES = (capabilities.BitMasks.READ_RANDOM |
+                     capabilities.BitMasks.WRITE_ACCESS |
+                     capabilities.BitMasks.DRIVER_REUSABLE)
+
+    OPTIONS = _FILESYSTEM_CONFIGS
+    READ_CHUNKSIZE = 64 * units.Ki
+    WRITE_CHUNKSIZE = READ_CHUNKSIZE
+    FILESYSTEM_STORE_METADATA = None
+    IMAGE = None
+
+    def __init__(self, datadir=None, datadirs=None, metadata_file=None):
+        self.datadir = datadir
+        self.datadirs = datadirs
+        self.metadata_file = metadata_file
+
+    def get_schemes(self):
+        return ('file', 'filesystem')
+
+    def _check_write_permission(self):
+        """
+        Checks if directory created to write image files has
+        write permission.
+
+        :raise BadStoreConfiguration exception if datadir is read-only.
+        """
+        if not os.access(self.datadir, os.W_OK):
+            msg = (_("Permission to write in %s denied") % self.datadir)
+            LOG.exception(msg)
+            raise exceptions.BadStoreConfiguration(
+                store_name="filesystem", reason=msg)
+
+    def _set_exec_permission(self, permissions):
+        """
+        Set the execution permission of owner-group and/or other-users to
+        image directory if the image file which contained needs relevant
+        access permissions.
+
+        """
+
+        if permissions <= 0:
+            return
+
+        try:
+            mode = os.stat(self.datadir)[stat.ST_MODE]
+            perm = int(str(permissions),
+                       8)
+            if perm & stat.S_IRWXO > 0:
+                if not mode & stat.S_IXOTH:
+                    # chmod o+x
+                    mode |= stat.S_IXOTH
+                    os.chmod(datadir, mode)
+            if perm & stat.S_IRWXG > 0:
+                if not mode & stat.S_IXGRP:
+                    # chmod g+x
+                    os.chmod(datadir, mode | stat.S_IXGRP)
+        except (IOError, OSError):
+            LOG.warn(_LW("Unable to set execution permission of owner-group "
+                         "and/or other-users to datadir: %s") % datadir)
+
+    def _create_image_directories(self, directory_paths, permissions):
+        """
+        Create directories to write image files if
+        it does not exist.
+
+        :directory_paths is a list of directories belonging to glance store.
+        :raise BadStoreConfiguration exception if creating a directory fails.
+        """
+        for datadir in directory_paths:
+            if os.path.exists(datadir):
+                self._check_write_permission()
+                self._set_exec_permission(permissions)
+            else:
+                msg = _("Directory to write image files does not exist "
+                        "(%s). Creating.") % datadir
+                LOG.info(msg)
+                try:
+                    os.makedirs(datadir)
+                    self._check_write_permission()
+                    self._set_exec_permission(permissions)
+                except (IOError, OSError):
+                    if os.path.exists(datadir):
+                        # NOTE(markwash): If the path now exists, some other
+                        # process must have beat us in the race condition.
+                        # But it doesn't hurt, so we can safely ignore
+                        # the error.
+                        self._check_write_permission()
+                        self._set_exec_permission(permissions)
+                        continue
+                    reason = _("Unable to create datadir: %s") % datadir
+                    LOG.error(reason)
+                    raise exceptions.BadStoreConfiguration(
+                        store_name="filesystem", reason=reason)
+
+    def _validate_metadata(self, metadata_file=None):
+        """Validate metadata against json schema.
+
+        If metadata is valid then cache metadata and use it when
+        creating new image.
+
+        :param metadata_file: JSON metadata file path
+        :raises: BadStoreConfiguration exception if metadata is not valid.
+        """
+        if metadata_file is None:
+            metadata_file = self.metadata_file
+
+        try:
+            with open(metadata_file, 'r') as fptr:
+                metadata = jsonutils.load(fptr)
+
+            if isinstance(metadata, dict):
+                # If metadata is of type dictionary
+                # i.e. - it contains only one mountpoint
+                # then convert it to list of dictionary.
+                metadata = [metadata]
+
+            # Validate metadata against json schema
+            jsonschema.validate(metadata, MULTI_FILESYSTEM_METADATA_SCHEMA)
+            glance_store.check_location_metadata(metadata)
+            self.FILESYSTEM_STORE_METADATA = metadata
+        except (jsonschema.exceptions.ValidationError,
+                exceptions.BackendException, ValueError) as vee:
+            reason = _('The JSON in the metadata file %(file)s is '
+                       'not valid and it can not be used: '
+                       '%(vee)s.') % dict(file=metadata_file,
+                                          vee=utils.exception_to_str(vee))
+            LOG.error(reason)
+            raise exceptions.BadStoreConfiguration(
+                store_name="filesystem", reason=reason)
+        except IOError as ioe:
+            reason = _('The path for the metadata file %(file)s could '
+                       'not be accessed: '
+                       '%(ioe)s.') % dict(file=metadata_file,
+                                          ioe=utils.exception_to_str(ioe))
+            LOG.error(reason)
+            raise exceptions.BadStoreConfiguration(
+                store_name="filesystem", reason=reason)
+
+    def configure_add(self, permissions):
+        """
+        Configure the Store to use the stored configuration options
+        Any store that needs special configuration should implement
+        this method. If the store was not able to successfully configure
+        itself, it should raise `exceptions.BadStoreConfiguration`
+        """
+        if not (self.datadir
+                or self.datadirs):
+            reason = (_("Specify at least 'filesystem_store_datadir' or "
+                        "'filesystem_store_datadirs' option"))
+            LOG.error(reason)
+            raise exceptions.BadStoreConfiguration(store_name="filesystem",
+                                                   reason=reason)
+
+        if (self.datadir and self.datadirs):
+
+            reason = (_("Specify either 'filesystem_store_datadir' or "
+                        "'filesystem_store_datadirs' option"))
+            LOG.error(reason)
+            raise exceptions.BadStoreConfiguration(store_name="filesystem",
+                                                   reason=reason)
+
+        if permissions > 0:
+            perm = int(str(permissions),
+                       8)
+            if not perm & stat.S_IRUSR:
+                reason = _LE("Specified an invalid "
+                             "'filesystem_store_file_perm' option which "
+                             "could make image file to be unaccessible by "
+                             "glance service.")
+                LOG.error(reason)
+                reason = _("Invalid 'filesystem_store_file_perm' option.")
+                raise exceptions.BadStoreConfiguration(store_name="filesystem",
+                                                       reason=reason)
+
+        self.multiple_datadirs = False
+        directory_paths = set()
+        if datadirs is None:
+            directory_paths.add(self.datadir)
+        else:
+            self.multiple_datadirs = True
+            self.priority_data_map = {}
+            for datadir in self.datadirs:
+                (datadir_path,
+                 priority) = self._get_datadir_path_and_priority(datadir)
+                self._check_directory_paths(datadir_path, directory_paths)
+                directory_paths.add(datadir_path)
+                self.priority_data_map.setdefault(int(priority),
+                                                  []).append(datadir_path)
+
+            self.priority_list = sorted(self.priority_data_map,
+                                        reverse=True)
+
+        self._create_image_directories(directory_paths)
+
+        # TODO(cpallares): FIX THIS
+        if self.metadata_file:
+            self._validate_metadata(self.metadata_file)
+
+    def _check_directory_paths(self):
+        """
+        Checks if directory_path is already present in directory_paths.
+
+        :datadir_path is directory path.
+        :datadir_paths is set of all directory paths.
+        :raise BadStoreConfiguration exception if same directory path is
+               already present in directory_paths.
+        """
+        if self.datadir in self.datadirs:
+            msg = (_("Directory %(datadir_path)s specified "
+                     "multiple times in filesystem_store_datadirs "
+                     "option of filesystem configuration") %
+                   {'datadir_path': datadir_path})
+            LOG.exception(msg)
+            raise exceptions.BadStoreConfiguration(
+                store_name="filesystem", reason=msg)
+
+    def _get_datadir_path_and_priority(self, datadir, priority=0):
+        """
+        Gets directory paths and its priority from
+        filesystem_store_datadirs option in glance-api.conf.
+
+        :datadir is directory path with its priority.
+        :returns datadir_path as directory path
+                 priority as priority associated with datadir_path
+        :raise BadStoreConfiguration exception if priority is invalid or
+               empty directory path is specified.
+        """
+        parts = map(lambda x: x.strip(), datadir.rsplit(":", 1))
+        datadir_path = parts[0]
+        if len(parts) == 2 and parts[1]:
+            priority = parts[1]
+            if not priority.isdigit():
+                msg = (_("Invalid priority value %(priority)s in "
+                         "filesystem configuration") % {'priority': priority})
+                LOG.exception(msg)
+                raise exceptions.BadStoreConfiguration(
+                    store_name="filesystem", reason=msg)
+
+        if not datadir_path:
+            msg = _("Invalid directory specified in filesystem configuration")
+            LOG.exception(msg)
+            raise exceptions.BadStoreConfiguration(
+                store_name="filesystem", reason=msg)
+
+        return datadir_path, priority
+
+    @staticmethod
+    def _resolve_location(location):
+        filepath = location.store_location.path
+
+        if not os.path.exists(filepath):
+            raise exceptions.NotFound(image=filepath)
+
+        filesize = os.path.getsize(filepath)
+        return filepath, filesize
+
+    def _get_metadata(self, location):
+        """Return metadata dictionary.
+
+        If metadata is provided as list of dictionaries then return
+        metadata as dictionary containing 'id' and 'mountpoint'.
+
+        If there are multiple nfs directories (mountpoints) configured
+        for glance, then we need to create metadata JSON file as list
+        of dictionaries containing all mountpoints with unique id.
+        But Nova will not be able to find in which directory (mountpoint)
+        image is present if we store list of dictionary(containing mountpoints)
+        in glance image metadata. So if there are multiple mountpoints then
+        we will return dict containing exact mountpoint where image is stored.
+
+        If image path does not start with any of the 'mountpoint' provided
+        in metadata JSON file then error is logged and empty
+        dictionary is returned.
+
+        :param filepath: Path of image on store
+        :returns: metadata dictionary
+        """
+        if self.FILESYSTEM_STORE_METADATA:
+            for image_meta in self.FILESYSTEM_STORE_METADATA:
+                if filepath.startswith(image_meta['mountpoint']):
+                    return image_meta
+
+            reason = (_LE("The image path %(path)s does not match with "
+                          "any of the mountpoint defined in "
+                          "metadata: %(metadata)s. An empty dictionary "
+                          "will be returned to the client.")
+                      % dict(path=filepath,
+                             metadata=self.FILESYSTEM_STORE_METADATA))
+            LOG.error(reason)
+
+        return {}
+
+    def _get_capacity_info(self, datadir):
+        """Calculates total available space for given mount point.
+
+        :datadir is path of glance data directory
+        """
+
+        # Calculate total available space
+        stvfs_result = os.statvfs(datadir)
+        total_available_space = stvfs_result.f_bavail * stvfs_result.f_bsize
+        return max(0, total_available_space)
+
+    def _find_best_datadir(self, image_size):
+        """Finds the best datadir by priority and free space.
+
+        Traverse directories returning the first one that has sufficient
+        free space, in priority order. If two suitable directories have
+        the same priority, choose the one with the most free space
+        available.
+        :image_size size of image being uploaded.
+        :returns best_datadir as directory path of the best priority datadir.
+        :raises exceptions.StorageFull if there is no datadir in
+                self.priority_data_map that can accommodate the image.
+        """
+        if not self.datadirs:
+            return self.datadir
+
+        best_datadir = None
+        max_free_space = 0
+        for priority in self.priority_list:
+            for datadir in self.priority_data_map.get(priority):
+                free_space = self._get_capacity_info(datadir)
+                if free_space >= image_size and free_space > max_free_space:
+                    max_free_space = free_space
+                    best_datadir = datadir
+
+            # If datadir is found which can accommodate image and has maximum
+            # free space for the given priority then break the loop,
+            # else continue to lookup further.
+            if best_datadir:
+                break
+        else:
+            msg = (_("There is no enough disk space left on the image "
+                     "storage media. requested=%s") % image_size)
+            LOG.exception(msg)
+            raise exceptions.StorageFull(message=msg)
+
+        return best_datadir
+
+    def __iter__(self, offset=0, chunk_size=None, partial=False):
+        """
+        Return an iterator over the image file.
+
+        :param offset:
+        :param chunk_size:
+        :param partial:
+        """
+
+        if os.path.exists(self.location):
+            try:
+                LOG.debug(_("Reading image at %s") % self.location)
+                image = open(self.location, 'rb')
+            except OSError:
+                raise exceptions.Forbidden()
+        raise exceptions.NotFound(image=self.location)
+
+        if offset:
+            image.seek(offset)
+
+        if chunk_size is None:
+            chunk_size = self.READ_CHUNKSIZE
+
+        try:
+            if image:
+                while True:
+                    chunk = image.read(chunk_size)
+                    if chunk:
+                        yield chunk
+                        if partial:
+                            break
+                    else:
+                        break
+        finally:
+            image.close()
+
+    def __enter__(self):
+        if os.path.exists(self.location):
+            try:
+                LOG.debug(_("Reading image at %s") % self.location)
+                self.image = open(self.location, 'rw')
+                return self.image
+            except OSError:
+                raise exceptions.Forbidden()
+        raise exceptions.NotFound(image=self.location)
+
+    def __exit__(self):
+        self.image.close()
+
+    def write(self, iid, image_data, size=0, permission=0):
+        """
+        Stores an image file to the location specified.
+
+        :param image_id: The opaque image identifier
+        :param image_data: The image data to write, as a file-like object
+        :param image_size: The size of the image data to write, in bytes
+
+        :retval the URL in backing store, bytes written, checksum
+                and a dictionary with storage system specific information
+        :raises `glance_store.exceptions.Duplicate` if the image already
+                exists
+        """
+
+        datadir = self._find_best_datadir(size)
+        filepath = os.path.join(datadir, str(iid))
+
+        if os.path.exists(filepath):
+            raise exceptions.Duplicate(message="Image could not be found.")
+
+        checksum = hashlib.md5()
+        bytes_written = 0
+
+        try:
+            with open(filepath, 'wb') as f:
+                for buf in utils.chunkreadable(image_data,
+                                               self.WRITE_CHUNKSIZE
+):
+                    bytes_written += len(buf)
+                    checksum.update(buf)
+                    f.write(buf)
+        except IOError as e:
+            if e.errno != errno.EACCES:
+                self._delete_partial(filepath, iid)
+            errors = {errno.EFBIG: exceptions.StorageFull(),
+                      errno.ENOSPC: exceptions.StorageFull(),
+                      errno.EACCES: exceptions.StorageWriteDenied()}
+            raise errors.get(e.errno, e)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self._delete_partial(filepath, iid)
+
+        checksum_hex = checksum.hexdigest()
+
+        LOG.debug(_("Wrote %(bytes_written)d bytes with "
+                    "checksum %(checksum_hex)s"),
+                  {'bytes_written': bytes_written,
+                   'checksum_hex': checksum_hex})
+
+        if permission > 0:
+            perm = int(str(permission),
+                       8)
+            try:
+                os.chmod(filepath, permission)
+            except (IOError, OSError):
+                LOG.warn(_LW("Unable to set permission to image: %s") %
+                         filepath)
+
+        return ('file://%s' % filepath, bytes_written, checksum_hex)
+
+
+
+    def read(self, location, size=None):
+        """
+        Reads an image at a location specified.
+
+        :param location: filepath to the image
+        :param size: Size of the image in bytes
+
+        :raises NotFound if image does not exist
+        :raises Forbidden if user does not have permission to read image.
+        """
+
+        filepath, filesize = self._resolve_location(location)
+
+        if os.path.exists(filepath):
+            try:
+                if size is None:
+                    size = os.path.getsize(filepath)
+                LOG.debug(_("Reading image at %s") % filepath)
+                with open(filepath, 'r') as image:
+                    return image.read(size)
+            except OSError:
+                raise exceptions.Forbidden()
+        raise exceptions.NotFound(image=filepath)
+
+    def seek(self, offset=0):
+        """
+        Opens an image at an offset specified.
+
+        :param offset:
+
+        :raises NotFound if image does not exist :raises Forbidden if cannot
+        write the image if the user does not have
+        the correct permissions.
+        """
+        if os.access(self.location, os.W_OK):
+            try:
+                LOG.debug(_("Seeking image at %s") % self.location)
+                with open(self.location, 'r') as image:
+                    return image.seek(offset)
+            except OSError:
+                raise exceptions.Forbidden()
+        raise exceptions.NotFound(message="Image could not be found")
+
+    def delete(self, location):
+        """
+        Deletes an image in the location specified.
+
+        :raises NotFound if image does not exist
+        :raises OSError if file cannot be deleted
+        """
+        loc = location.store_location
+        filepath = loc.path
+        if os.path.exists(filepath):
+            try:
+                LOG.debug(_("Deleting image at %(filepath)s"), {'filepath': filepath})
+                os.unlink(filepath)
+            except OSError:
+                raise exceptions.Forbidden(_("You cannot delete file %s") % filepath)
+        else:
+            raise exceptions.NotFound(image=filepath)
+
+
+#        try:
+#            if not partial:
+#                filepath, filesize = self._resolve_location(location)
+#            os.unlink(filepath)
+#        except Exception:
+#            pass
+#
+#        if os.path.exists(filepath):
+#            try:
+#                LOG.debug(_("Deleting image at %s") % filepath)
+#                os.unlink(filepath)
+#                return True
+#            except OSError:
+#                raise exceptions.Forbidden()
+#        raise exceptions.NotFound(image=filepath)
+    @staticmethod
+    def _delete_partial(filepath, iid):
+        try:
+            os.unlink(filepath)
+        except Exception as e:
+            msg = _('Unable to remove partial image '
+                    'data for image %(iid)s: %(e)s')
+            LOG.error(msg % dict(iid=iid, e=utils.exception_to_str(e)))
